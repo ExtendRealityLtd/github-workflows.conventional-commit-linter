@@ -1,0 +1,351 @@
+name: Conventional Commit Linter
+
+on:
+  workflow_call:
+    inputs:
+      config-repo:
+        description: 'Repo containing commitlint.config.js'
+        required: false
+        type: string
+        default: 'ExtendRealityLtd/github-workflows.conventional-commit-linter'
+      config-ref:
+        description: 'Git ref of config repo (branch/tag/SHA)'
+        required: false
+        type: string
+        default: 'main'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  commitlint:
+    name: Validate Conventional Commit Messages
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Checkout config repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.config-repo }}
+          ref: ${{ inputs.config-ref }}
+          path: .commitlint-config
+          sparse-checkout: |
+            commitlint.config.js
+          sparse-checkout-cone-mode: false
+
+      - name: Validate commits (build detailed PR comment)
+        id: validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LANG=C.UTF-8
+
+          cp .commitlint-config/commitlint.config.js ./commitlint.config.js
+
+          # Generate a safely-quoted env.sh from config
+          cat > parse-config.js <<'EOF'
+          const fs = require('fs');
+          const cfg = require('./commitlint.config.js') || {};
+          const rules = cfg.rules || {};
+          const cr = cfg.customRules || {};
+          const m = cr.messages || {};
+
+          const typeEnum        = (rules['type-enum'] && rules['type-enum'][2]) || ['feat','fix','chore','refactor'];
+          const maxHeader       = (rules['header-max-length'] && rules['header-max-length'][2]) || 72;
+          const maxBodyLine     = (rules['body-max-line-length'] && rules['body-max-line-length'][2]) || 72;
+          const maxFooterLine   = (rules['footer-max-line-length'] && rules['footer-max-line-length'][2]) || 72;
+          const scopeRequired   = (rules['scope-empty'] && rules['scope-empty'][1]) === 'never';
+          const subjectMin      = (rules['subject-min-length'] && rules['subject-min-length'][2]) || 3;
+          const subjectCase     = rules['subject-case'] && rules['subject-case'][2];
+          const subjectLower    = subjectCase === 'lower-case';
+          const sf              = rules['subject-full-stop'];
+          const noTrailing      = Array.isArray(sf) && sf[1] === 'never' && sf[2] === '.';
+          const bodyLeadingBlank= (rules['body-leading-blank'] && rules['body-leading-blank'][1]) === 'always';
+
+          const bodyReqTypes    = cr.bodyRequiredForTypes || [];
+          const enforceBreaking = cr.enforceBreakingChangeConsistency !== false;
+
+          const shQ = (s) => String(s ?? '').replace(/'/g, `'\"'\"'`);
+          const out = [];
+          out.push(`VALID_TYPES='${shQ(typeEnum.join('|'))}'`);
+          out.push(`MAX_HEADER_LENGTH='${shQ(maxHeader)}'`);
+          out.push(`MAX_BODY_LINE='${shQ(maxBodyLine)}'`);
+          out.push(`MAX_FOOTER_LINE='${shQ(maxFooterLine)}'`);
+          out.push(`SCOPE_REQUIRED='${shQ(scopeRequired)}'`);
+          out.push(`SUBJECT_MIN_LENGTH='${shQ(subjectMin)}'`);
+          out.push(`SUBJECT_LOWERCASE='${shQ(subjectLower)}'`);
+          out.push(`NO_TRAILING_PERIOD='${shQ(!!noTrailing)}'`);
+          out.push(`BODY_LEADING_BLANK='${shQ(bodyLeadingBlank)}'`);
+          out.push(`BODY_REQUIRED_TYPES='${shQ(bodyReqTypes.join('|'))}'`);
+          out.push(`ENFORCE_BREAKING_CHANGES='${shQ(enforceBreaking)}'`);
+          out.push(`FOOTER_COUNTS_AS_BODY='${shQ(!!cr.footerCountsAsBody)}'`);
+
+          // Messages (with fallbacks)
+          const msgs = {
+            MSG_HEADER_FORMAT:         m.headerFormat || 'Header must follow format: type(scope): description',
+            MSG_INVALID_TYPE:          m.invalidType || 'Invalid commit type. Valid types: feat, fix, chore, refactor',
+            MSG_SCOPE_REQUIRED:        m.scopeRequired || 'Scope is required and cannot be empty. Use format: type(scope): description',
+            MSG_DESCRIPTION_REQUIRED:  m.descriptionRequired || 'Description is required after ": "',
+            MSG_DESCRIPTION_TOO_SHORT: m.descriptionTooShort || 'Description too short (minimum 3 characters)',
+            MSG_LOWERCASE_REQUIRED:    m.lowercaseRequired || 'Description should start with lowercase letter',
+            MSG_NO_TRAILING_PERIOD:    m.noTrailingPeriod || 'Header should not end with a period',
+            MSG_HEADER_TOO_LONG:       m.headerTooLong || 'Header too long ({length} chars, max 72)',
+            MSG_BODY_REQUIRED_TYPE:    m.bodyRequiredForType || 'Body is required for {type} commits. Add a blank line after header, then describe what and why.',
+            MSG_BREAKING_NEEDS_FOOTER: (m.breakingNeedsFooter || m.breakingChangeInconsistent) || "Breaking change '!' in header requires 'BREAKING CHANGE:' in footer",
+            MSG_FOOTER_NEEDS_BANG:     (m.footerNeedsBang     || m.breakingChangeInconsistent) || "'BREAKING CHANGE:' in footer requires '!' in header",
+            MSG_EMPTY:                 m.cannotBeEmpty || 'Commit message cannot be empty',
+            MSG_NEED_BLANK_AFTER_HEADER: m.bodyLeadingBlank || 'Blank line required after header',
+            MSG_BODY_LINE_TOO_LONG:    m.bodyLineTooLong || 'Body line too long ({length} chars, max 72)',
+            MSG_FOOTER_LINE_TOO_LONG:  m.footerLineTooLong || 'Footer line too long ({length} chars, max 72)',
+          };
+          for (const [k, v] of Object.entries(msgs)) {
+            out.push(`${k}='${shQ(v)}'`);
+          }
+
+          fs.writeFileSync('env.sh', out.join('\n') + '\n');
+          EOF
+
+          node parse-config.js
+
+          # Load env safely
+          set -a
+          . ./env.sh
+          set +a
+
+          # Determine commit range
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+            HEAD="${{ github.sha }}"
+          fi
+
+          git rev-list --no-merges "${BASE}..${HEAD}" > commits.txt || true
+          COUNT=$(wc -l < commits.txt | tr -d ' ')
+          if [ "$COUNT" -eq 0 ]; then
+            echo "failed=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Build PR body
+          {
+            echo "## 🚫 Commit Message Validation Failed"
+            echo
+          } > pr_comment.md
+
+          VALIDATION_FAILED=0
+
+          while read -r commit_sha; do
+            [ -z "$commit_sha" ] && continue
+            short_sha="${commit_sha:0:7}"
+            # Full message as-is (strip CRs)
+            commit_msg="$(git show -s --format=%B "$commit_sha" | sed 's/\r$//')"
+
+            # Split lines for analysis
+            mapfile -t LINES < <(printf "%s\n" "$commit_msg")
+
+            # Find header (first non-empty)
+            header=""
+            header_idx=-1
+            for i in "${!LINES[@]}"; do
+              if [[ -n "${LINES[$i]//[[:space:]]/}" ]]; then
+                header="${LINES[$i]}"
+                header_idx=$i
+                break
+              fi
+            done
+
+            # Next line after header (might not exist)
+            next_idx=$((header_idx+1))
+            next_line="${LINES[$next_idx]-}"
+
+            # Is there a blank line immediately after header?
+            blank_after_header=false
+            if [[ "$BODY_LEADING_BLANK" == "true" ]]; then
+              if [[ -z "${next_line//[[:space:]]/}" ]]; then
+                blank_after_header=true
+              fi
+            fi
+
+            # Collect body lines (non-footer, after header)
+            body_present=false
+            body_lines=()
+            footer_lines=()
+            seen_header=false
+            for i in "${!LINES[@]}"; do
+              line="${LINES[$i]}"
+              # Skip leading empties until header found
+              if ! $seen_header; then
+                if [[ $i -eq $header_idx ]]; then
+                  seen_header=true
+                fi
+                continue
+              fi
+              # classify lines after header
+              if [[ "$line" =~ ^BREAKING[[:space:]-]CHANGE: ]]; then
+                footer_lines+=("$line")
+                continue
+              fi
+              # non-footer line
+              if [[ -n "${line//[[:space:]]/}" ]]; then
+                # count as body only if it's not the immediate line when a blank is required but missing
+                if [[ "$BODY_LEADING_BLANK" == "true" && $i -eq $next_idx && -n "${line//[[:space:]]/}" ]]; then
+                  : # body will still be considered present (we enforce missing blank separately)
+                fi
+                body_present=true
+                body_lines+=("$line")
+              fi
+            done
+
+            # Start per-commit evaluation
+            commit_errors=""
+            has_errors=false
+
+            if [[ -z "$header" ]]; then
+              commit_errors+="    ❌ ${MSG_EMPTY}\n"
+              has_errors=true
+            else
+              # Format (scope required or optional)
+              if [[ "$SCOPE_REQUIRED" == "true" ]]; then
+                pattern='^[a-z]+\([^)]+\)(!)?: .+'
+              else
+                pattern='^[a-z]+(\([^)]+\))?(!)?: .+'
+              fi
+              if ! echo "$header" | grep -qE "$pattern"; then
+                commit_errors+="    ❌ ${MSG_HEADER_FORMAT}\n"
+                has_errors=true
+              else
+                commit_type="$(echo "$header" | sed -E 's/^([a-z]+).*/\1/')"
+                if ! echo "$commit_type" | grep -qE "^(${VALID_TYPES})$"; then
+                  commit_errors+="    ❌ ${MSG_INVALID_TYPE}\n"
+                  has_errors=true
+                fi
+
+                if [[ "$SCOPE_REQUIRED" == "true" ]] && ! echo "$header" | grep -qE '^[a-z]+\([^)]+\)'; then
+                  commit_errors+="    ❌ ${MSG_SCOPE_REQUIRED}\n"
+                  has_errors=true
+                fi
+
+                description="$(echo "$header" | sed -E 's/^[a-z]+(\([^)]+\))?(!)?: (.*)/\3/' 2>/dev/null || true)"
+                if [[ -z "$description" ]]; then
+                  commit_errors+="    ❌ ${MSG_DESCRIPTION_REQUIRED}\n"
+                  has_errors=true
+                elif (( ${#description} < SUBJECT_MIN_LENGTH )); then
+                  commit_errors+="    ❌ ${MSG_DESCRIPTION_TOO_SHORT}\n"
+                  has_errors=true
+                fi
+
+                if [[ "$SUBJECT_LOWERCASE" == "true" ]] && echo "$header" | grep -qE '^[a-z]+(\([^)]+\))?(!)?: [A-Z]'; then
+                  commit_errors+="    ❌ ${MSG_LOWERCASE_REQUIRED}\n"
+                  has_errors=true
+                fi
+
+                if [[ "$NO_TRAILING_PERIOD" == "true" ]] && echo "$header" | grep -qE '\.$'; then
+                  commit_errors+="    ❌ ${MSG_NO_TRAILING_PERIOD}\n"
+                  has_errors=true
+                fi
+              fi
+
+              if (( ${#header} > MAX_HEADER_LENGTH )); then
+                commit_errors+="    ❌ ${MSG_HEADER_TOO_LONG//\{length\}/${#header}}\n"
+                has_errors=true
+              fi
+            fi
+
+            # Enforce blank line after header
+            if [[ "$BODY_LEADING_BLANK" == "true" ]]; then
+              if [[ "$header_idx" -ge 0 ]]; then
+                if ! $blank_after_header; then
+                  commit_errors+="    ❌ ${MSG_NEED_BLANK_AFTER_HEADER}\n"
+                  has_errors=true
+                fi
+              fi
+            fi
+
+            # Body required for certain types
+            if [[ -n "$BODY_REQUIRED_TYPES" ]] && echo "$commit_type" | grep -qE "^(${BODY_REQUIRED_TYPES})$"; then
+              effective_body_present="$body_present"
+              # If allowed, treat presence of any footer as satisfying the body requirement
+              if [[ "${FOOTER_COUNTS_AS_BODY:-false}" == "true" && ${#footer_lines[@]} -gt 0 ]]; then
+                effective_body_present=true
+              fi
+              if [[ "$effective_body_present" == "false" ]]; then
+                commit_errors+="    ❌ ${MSG_BODY_REQUIRED_TYPE//\{type\}/$commit_type}\n"
+                has_errors=true
+              fi
+            fi
+
+            # Line length checks
+            if [[ ${#body_lines[@]} -gt 0 ]]; then
+              for line in "${body_lines[@]}"; do
+                len=${#line}
+                if (( len > MAX_BODY_LINE )); then
+                  commit_errors+="    ❌ ${MSG_BODY_LINE_TOO_LONG//\{length\}/$len}\n"
+                  has_errors=true
+                fi
+              done
+            fi
+            if [[ ${#footer_lines[@]} -gt 0 ]]; then
+              for line in "${footer_lines[@]}"; do
+                len=${#line}
+                if (( len > MAX_FOOTER_LINE )); then
+                  commit_errors+="    ❌ ${MSG_FOOTER_LINE_TOO_LONG//\{length\}/$len}\n"
+                  has_errors=true
+                fi
+              done
+            fi
+
+            # Breaking change consistency
+            if [[ "$ENFORCE_BREAKING_CHANGES" == "true" ]]; then
+              has_breaking_header=$(echo "$header" | grep -c "!" || true)
+              has_breaking_footer=$(printf "%s\n" "${footer_lines[@]}" | grep -cE "^BREAKING[ -]CHANGE:" || true)
+              if [[ "$has_breaking_header" -gt 0 && "$has_breaking_footer" -eq 0 ]]; then
+                commit_errors+="    ❌ ${MSG_BREAKING_NEEDS_FOOTER}\n"
+                has_errors=true
+              elif [[ "$has_breaking_header" -eq 0 && "$has_breaking_footer" -gt 0 ]]; then
+                commit_errors+="    ❌ ${MSG_FOOTER_NEEDS_BANG}\n"
+                has_errors=true
+              fi
+            fi
+
+            if [[ "$has_errors" == true ]]; then
+              {
+                echo "📝 Commit $short_sha"
+                echo "$header"
+                echo
+                printf "%b" "$commit_errors"
+                echo
+              } >> pr_comment.md
+              VALIDATION_FAILED=1
+            fi
+          done < commits.txt
+
+          echo "failed=$VALIDATION_FAILED" >> $GITHUB_OUTPUT
+
+      - name: Post PR comment
+        if: ${{ steps.validate.outputs.failed == '1' && github.event_name == 'pull_request' }}
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: pr_comment.md
+          edit-mode: replace
+          body-includes: "Commit Message Validation Failed"
+
+      - name: Fail workflow if validation failed
+        if: ${{ steps.validate.outputs.failed == '1' }}
+        run: |
+          echo "::error::Commit message validation failed. See PR comment for details."
+          cat pr_comment.md || true
+          exit 1
